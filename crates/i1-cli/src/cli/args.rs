@@ -67,6 +67,10 @@ pub enum Commands {
 
     /// Manage CLI configuration
     Config(ConfigArgs),
+
+    /// Quick threat response: lookup + optional ban in one command
+    #[command(alias = "t")]
+    Threat(ThreatArgs),
 }
 
 // ============================================================================
@@ -81,6 +85,32 @@ pub struct HostArgs {
     /// Query all configured providers
     #[arg(long)]
     pub all: bool,
+}
+
+// ============================================================================
+// Threat command - quick response: lookup + ban
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct ThreatArgs {
+    /// IP address to investigate
+    pub ip: String,
+
+    /// Automatically ban the IP after lookup
+    #[arg(long, short)]
+    pub ban: bool,
+
+    /// Also ban the entire AS number
+    #[arg(long, short = 'a')]
+    pub ban_asn: bool,
+
+    /// Skip confirmation prompts
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Generate and show iptables command to run
+    #[arg(long, short = 'x')]
+    pub execute: bool,
 }
 
 // ============================================================================
@@ -200,6 +230,101 @@ pub enum DefendCommands {
 
     /// Emergency disable all blocking
     Disable,
+
+    /// Push blocks to remote servers via SSH
+    Push(PushArgs),
+
+    /// Pull blocks from a remote server via SSH
+    Pull(PullArgs),
+
+    /// Community threat intelligence sharing
+    Community(CommunityArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CommunityArgs {
+    #[command(subcommand)]
+    pub command: CommunityCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CommunityCommands {
+    /// Contribute your blocked IPs to the community
+    Contribute {
+        /// Include fail2ban blocks
+        #[arg(long, short)]
+        fail2ban: bool,
+
+        /// Minimum times an IP must be blocked to contribute (default: 3)
+        #[arg(long, default_value = "3")]
+        min_hits: u32,
+
+        /// Show what would be contributed without sending
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Fetch community blocklist
+    Fetch {
+        /// Minimum reports before including (default: 5)
+        #[arg(long, default_value = "5")]
+        min_reports: u32,
+
+        /// Merge with existing (default: true)
+        #[arg(long)]
+        replace: bool,
+
+        /// Show what would be fetched without saving
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Set up automatic sync via cron
+    Subscribe {
+        /// Sync interval in hours (default: 6)
+        #[arg(long, default_value = "6")]
+        interval: u32,
+
+        /// Remove the cron job
+        #[arg(long)]
+        remove: bool,
+    },
+
+    /// Show community stats
+    Stats,
+}
+
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// Host from SSH config to pull from
+    pub host: String,
+
+    /// Merge with existing blocks (default: replace)
+    #[arg(long, short)]
+    pub merge: bool,
+
+    /// Show what would be pulled without saving
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PushArgs {
+    /// Specific hosts from SSH config (comma-separated or multiple -H flags)
+    #[arg(short = 'H', long = "host", value_delimiter = ',')]
+    pub hosts: Option<Vec<String>>,
+
+    /// Push to all hosts in SSH config
+    #[arg(long, short)]
+    pub all: bool,
+
+    /// Show what would be pushed without executing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Only push IPs blocked since this command (not full list)
+    #[arg(long)]
+    pub incremental: bool,
 }
 
 #[derive(Args, Debug)]

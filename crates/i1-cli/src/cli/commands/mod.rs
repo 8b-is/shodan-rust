@@ -7,6 +7,7 @@ pub mod dns;
 pub mod host;
 pub mod myip;
 pub mod search;
+pub mod threat;
 
 use crate::output::OutputFormat;
 

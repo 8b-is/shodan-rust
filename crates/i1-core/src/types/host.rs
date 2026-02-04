@@ -6,8 +6,8 @@ use std::net::IpAddr;
 /// Complete host information from Shodan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
-    /// IP address (parsed)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// IP address (parsed) - skipped during deserialization as Shodan returns integer
+    #[serde(skip_deserializing, default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<IpAddr>,
 
     /// IP address as string

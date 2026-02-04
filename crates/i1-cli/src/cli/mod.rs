@@ -54,5 +54,6 @@ pub async fn run() -> Result<()> {
         Commands::Myip => commands::myip::execute(ctx).await,
         Commands::Defend(args) => commands::defend::execute(ctx, args).await,
         Commands::Config(args) => commands::config::execute(ctx, args).await,
+        Commands::Threat(args) => commands::threat::execute(&ctx, &args).await,
     }
 }

@@ -5,7 +5,8 @@ use colored::Colorize;
 
 use super::Context;
 use crate::cli::args::{
-    DefendArgs, DefendCommands, GeoblockArgs, GeoblockCommands, WhitelistArgs, WhitelistCommands,
+    CommunityArgs, CommunityCommands, DefendArgs, DefendCommands, GeoblockArgs, GeoblockCommands,
+    PullArgs, PushArgs, WhitelistArgs, WhitelistCommands,
 };
 use crate::defend;
 use crate::output::OutputFormat;
@@ -25,6 +26,9 @@ pub async fn execute(ctx: Context, args: DefendArgs) -> Result<()> {
         DefendCommands::Import { stdin, file } => import(ctx, stdin, file.as_deref()).await,
         DefendCommands::Undo => undo(ctx).await,
         DefendCommands::Disable => disable(ctx).await,
+        DefendCommands::Push(args) => push(ctx, args).await,
+        DefendCommands::Pull(args) => pull(ctx, args).await,
+        DefendCommands::Community(args) => community(ctx, args).await,
     }
 }
 
@@ -247,6 +251,23 @@ async fn geoblock(_ctx: Context, args: GeoblockArgs) -> Result<()> {
 }
 
 async fn ban(_ctx: Context, target: &str, as_number: bool, dry_run: bool) -> Result<()> {
+    // Safety check: refuse to block your own SSH session
+    if let Some(ssh_ip) = get_ssh_client_ip() {
+        if target == ssh_ip || target.starts_with(&format!("{}/", ssh_ip)) {
+            println!(
+                "{} Refusing to block {} - that's your current SSH session!",
+                "🛡️ PROTECTED:".yellow().bold(),
+                target.cyan()
+            );
+            println!();
+            println!(
+                "{}",
+                "This prevents you from locking yourself out.".dimmed()
+            );
+            return Ok(());
+        }
+    }
+
     let mut state = defend::State::load()?;
 
     if as_number {
@@ -412,4 +433,922 @@ async fn disable(_ctx: Context) -> Result<()> {
     println!();
     println!("This is a safety feature - not applying automatically.");
     Ok(())
+}
+
+async fn push(_ctx: Context, args: PushArgs) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let state = defend::State::load()?;
+
+    // Get current user's public IP to auto-whitelist
+    let my_ip = get_my_public_ip().await.ok();
+
+    // Parse SSH config
+    let ssh_config_path = shellexpand::tilde("~/.ssh/config").to_string();
+    let hosts = parse_ssh_config(&ssh_config_path)?;
+
+    if hosts.is_empty() {
+        println!("{} No hosts found in ~/.ssh/config", "Error:".red().bold());
+        println!();
+        println!("Add hosts to your SSH config like:");
+        println!("  Host myserver");
+        println!("    HostName 1.2.3.4");
+        println!("    User root");
+        return Ok(());
+    }
+
+    // Determine which hosts to push to
+    let selected_hosts: Vec<String> = if let Some(ref specific) = args.hosts {
+        // Use specified hosts
+        specific
+            .iter()
+            .filter(|h| hosts.contains(h))
+            .cloned()
+            .collect()
+    } else if args.all {
+        // Use all hosts
+        hosts.clone()
+    } else {
+        // Interactive selection
+        println!("{}", "Available SSH hosts:".bold());
+        for (i, host) in hosts.iter().enumerate() {
+            println!("  [{}] {}", i + 1, host.cyan());
+        }
+        println!("  [a] All hosts");
+        println!("  [q] Quit");
+        println!();
+
+        print!("{} ", "Select hosts (e.g., 1,2,3 or 'a' for all):".cyan());
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+
+        if input == "q" || input.is_empty() {
+            println!("{}", "Cancelled.".dimmed());
+            return Ok(());
+        }
+
+        if input == "a" {
+            hosts.clone()
+        } else {
+            input
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter_map(|i| hosts.get(i.saturating_sub(1)).cloned())
+                .collect()
+        }
+    };
+
+    if selected_hosts.is_empty() {
+        println!("{} No valid hosts selected.", "Error:".red().bold());
+        return Ok(());
+    }
+
+    // Build iptables commands
+    let mut commands: Vec<String> = Vec::new();
+
+    // Always whitelist the user's IP first!
+    if let Some(ref ip) = my_ip {
+        commands.push(format!(
+            "iptables -C INPUT -s {} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -s {} -j ACCEPT",
+            ip, ip
+        ));
+    }
+
+    // Add blocked IPs
+    for ip in &state.blocked_ips {
+        commands.push(format!(
+            "iptables -C INPUT -s {} -j DROP 2>/dev/null || iptables -I INPUT -s {} -j DROP",
+            ip, ip
+        ));
+    }
+
+    // Add whitelisted IPs at the top
+    for ip in &state.whitelisted_ips {
+        commands.push(format!(
+            "iptables -C INPUT -s {} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -s {} -j ACCEPT",
+            ip, ip
+        ));
+    }
+
+    if commands.is_empty() {
+        println!("{} No rules to push.", "Note:".yellow());
+        return Ok(());
+    }
+
+    let script = commands.join(" && ");
+
+    println!();
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{} {} host(s)",
+        "Pushing to".green().bold(),
+        selected_hosts.len()
+    );
+    if let Some(ref ip) = my_ip {
+        println!(
+            "{} Your IP {} will be whitelisted first",
+            "✓".green(),
+            ip.yellow()
+        );
+    }
+    println!(
+        "{} {} blocked IPs",
+        "•".dimmed(),
+        state.blocked_ips.len()
+    );
+    println!(
+        "{} {} whitelisted IPs",
+        "•".dimmed(),
+        state.whitelisted_ips.len()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    if args.dry_run {
+        println!("{}", "[DRY RUN] Would execute:".yellow().bold());
+        println!();
+        for host in &selected_hosts {
+            println!("ssh {} '{}'", host.cyan(), script.dimmed());
+            println!();
+        }
+        return Ok(());
+    }
+
+    // Execute on each host
+    for host in &selected_hosts {
+        print!("{} {}... ", "→".cyan(), host);
+        std::io::stdout().flush()?;
+
+        let output = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(host)
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                println!("{}", "✓".green());
+            }
+            Ok(out) => {
+                println!("{}", "✗".red());
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.is_empty() {
+                    println!("    {}", stderr.trim().dimmed());
+                }
+            }
+            Err(e) => {
+                println!("{} {}", "✗".red(), e.to_string().dimmed());
+            }
+        }
+    }
+
+    println!();
+    println!("{}", "Done!".green().bold());
+
+    Ok(())
+}
+
+/// Parse SSH config and extract host names
+fn parse_ssh_config(path: &str) -> Result<Vec<String>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let reader = BufReader::new(file);
+    let mut hosts = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+
+        // Skip comments and empty lines
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Look for "Host" entries (but not "Host *")
+        if let Some(host_part) = line.strip_prefix("Host ").or_else(|| line.strip_prefix("Host\t"))
+        {
+            let host = host_part.trim();
+            // Skip wildcards and patterns
+            if !host.contains('*') && !host.contains('?') && !host.contains(' ') {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+
+    Ok(hosts)
+}
+
+/// Get current public IP address
+async fn get_my_public_ip() -> Result<String> {
+    let client = reqwest::Client::new();
+    let ip = client
+        .get("https://api.ipify.org")
+        .send()
+        .await?
+        .text()
+        .await?;
+    Ok(ip.trim().to_string())
+}
+
+/// Get the IP of the current SSH session (if any)
+fn get_ssh_client_ip() -> Option<String> {
+    // SSH_CLIENT format: "client_ip client_port server_port"
+    // SSH_CONNECTION format: "client_ip client_port server_ip server_port"
+    std::env::var("SSH_CLIENT")
+        .or_else(|_| std::env::var("SSH_CONNECTION"))
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(String::from))
+}
+
+async fn pull(_ctx: Context, args: PullArgs) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{} {}",
+        "Pulling blocks from:".cyan().bold(),
+        args.host.yellow()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    // SSH to remote and get iptables rules
+    print!("{} Fetching iptables rules... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(&args.host)
+        .arg("iptables -L INPUT -n 2>/dev/null; ip6tables -L INPUT -n 2>/dev/null")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        println!("{}", "✗".red());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("SSH failed: {}", stderr.trim());
+    }
+
+    println!("{}", "✓".green());
+
+    let rules_output = String::from_utf8_lossy(&output.stdout);
+
+    // Parse the iptables output to extract blocked IPs
+    let mut blocked_ips: Vec<String> = Vec::new();
+    let mut whitelisted_ips: Vec<String> = Vec::new();
+
+    for line in rules_output.lines() {
+        let line = line.trim();
+
+        // Look for DROP rules with source IP
+        // Format: "DROP       all  --  1.2.3.4              0.0.0.0/0"
+        if line.starts_with("DROP") {
+            if let Some(ip) = extract_source_ip(line) {
+                if !blocked_ips.contains(&ip) && ip != "0.0.0.0/0" && ip != "::/0" {
+                    blocked_ips.push(ip);
+                }
+            }
+        }
+
+        // Look for ACCEPT rules (whitelist) - only from specific IPs, not 0.0.0.0/0
+        if line.starts_with("ACCEPT") && !line.contains("state") && !line.contains("ctstate") {
+            if let Some(ip) = extract_source_ip(line) {
+                if !whitelisted_ips.contains(&ip)
+                    && ip != "0.0.0.0/0"
+                    && ip != "::/0"
+                    && !ip.starts_with("127.")
+                {
+                    whitelisted_ips.push(ip);
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("{}", "Found:".bold());
+    println!("  {} blocked IPs/ranges", blocked_ips.len().to_string().red());
+    println!(
+        "  {} whitelisted IPs",
+        whitelisted_ips.len().to_string().green()
+    );
+    println!();
+
+    if blocked_ips.is_empty() && whitelisted_ips.is_empty() {
+        println!("{}", "No rules found to import.".yellow());
+        return Ok(());
+    }
+
+    // Show preview
+    if !blocked_ips.is_empty() {
+        println!("{}", "Blocked IPs (first 10):".bold());
+        for ip in blocked_ips.iter().take(10) {
+            println!("  {}", ip.red());
+        }
+        if blocked_ips.len() > 10 {
+            println!("  ... and {} more", blocked_ips.len() - 10);
+        }
+        println!();
+    }
+
+    if !whitelisted_ips.is_empty() {
+        println!("{}", "Whitelisted IPs:".bold());
+        for ip in &whitelisted_ips {
+            println!("  {}", ip.green());
+        }
+        println!();
+    }
+
+    if args.dry_run {
+        println!("{}", "[DRY RUN] Would import the above rules.".yellow());
+        println!("Run without --dry-run to save.");
+        return Ok(());
+    }
+
+    // Load current state and merge/replace
+    let mut state = defend::State::load()?;
+
+    if args.merge {
+        // Merge with existing
+        for ip in blocked_ips {
+            if !state.blocked_ips.contains(&ip) {
+                state.blocked_ips.push(ip);
+            }
+        }
+        for ip in whitelisted_ips {
+            if !state.whitelisted_ips.contains(&ip) {
+                state.whitelisted_ips.push(ip);
+            }
+        }
+        println!("{} Merged rules with existing state.", "✓".green());
+    } else {
+        // Replace
+        state.blocked_ips = blocked_ips;
+        state.whitelisted_ips = whitelisted_ips;
+        println!("{} Replaced local state with remote rules.", "✓".green());
+    }
+
+    state.save()?;
+
+    println!();
+    println!(
+        "{}",
+        "Done! Use 'i1 defend status' to see current state.".dimmed()
+    );
+
+    Ok(())
+}
+
+async fn community(_ctx: Context, args: CommunityArgs) -> Result<()> {
+    match args.command {
+        CommunityCommands::Contribute {
+            fail2ban,
+            min_hits,
+            dry_run,
+        } => community_contribute(fail2ban, min_hits, dry_run).await,
+        CommunityCommands::Fetch {
+            min_reports,
+            replace,
+            dry_run,
+        } => community_fetch(min_reports, replace, dry_run).await,
+        CommunityCommands::Subscribe { interval, remove } => {
+            community_subscribe(interval, remove).await
+        }
+        CommunityCommands::Stats => community_stats().await,
+    }
+}
+
+/// Community API base URL
+const COMMUNITY_API: &str = "https://api.i1.is/v1/community";
+
+async fn community_contribute(fail2ban: bool, min_hits: u32, dry_run: bool) -> Result<()> {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{}",
+        "🌐 COMMUNITY THREAT SHARING".cyan().bold()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    let mut ips_to_contribute: HashMap<String, u32> = HashMap::new();
+
+    // Get IPs from local i1 state
+    let state = defend::State::load()?;
+    for ip in &state.blocked_ips {
+        *ips_to_contribute.entry(ip.clone()).or_insert(0) += 1;
+    }
+
+    // Get IPs from fail2ban if requested
+    if fail2ban {
+        print!("{} Scanning fail2ban... ", "→".cyan());
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        // Try to get banned IPs from fail2ban
+        let output = Command::new("fail2ban-client")
+            .args(["banned"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                // Parse fail2ban output - format varies but usually lists IPs
+                for line in stdout.lines() {
+                    // Extract IPs from the line
+                    for word in line.split(|c: char| !c.is_ascii_digit() && c != '.') {
+                        if is_valid_ip(word) {
+                            *ips_to_contribute.entry(word.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                println!("{}", "✓".green());
+            }
+            Ok(_) => {
+                // Try alternative: parse fail2ban log directly
+                let log_output = Command::new("sh")
+                    .args(["-c", "grep -h 'Ban' /var/log/fail2ban.log* 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | sort | uniq -c | sort -rn"])
+                    .output();
+
+                if let Ok(log_out) = log_output {
+                    let stdout = String::from_utf8_lossy(&log_out.stdout);
+                    for line in stdout.lines() {
+                        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(count) = parts[0].parse::<u32>() {
+                                let ip = parts[1];
+                                if is_valid_ip(ip) {
+                                    *ips_to_contribute.entry(ip.to_string()).or_insert(0) += count;
+                                }
+                            }
+                        }
+                    }
+                    println!("{} (from logs)", "✓".green());
+                } else {
+                    println!("{} (not available)", "⚠".yellow());
+                }
+            }
+            Err(_) => {
+                println!("{} (not installed)", "⚠".yellow());
+            }
+        }
+    }
+
+    // Filter by minimum hits
+    let filtered: Vec<(String, u32)> = ips_to_contribute
+        .into_iter()
+        .filter(|(_, count)| *count >= min_hits)
+        .collect();
+
+    if filtered.is_empty() {
+        println!();
+        println!(
+            "{} No IPs meet the minimum threshold of {} hits.",
+            "Note:".yellow(),
+            min_hits
+        );
+        println!("Try lowering --min-hits or add --fail2ban to include fail2ban data.");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{} {} IPs ready to contribute (min {} hits each)",
+        "Found:".bold(),
+        filtered.len().to_string().green(),
+        min_hits
+    );
+    println!();
+
+    // Show top offenders
+    let mut sorted = filtered.clone();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("{}", "Top offenders:".bold());
+    for (ip, count) in sorted.iter().take(10) {
+        println!("  {} (blocked {} times)", ip.red(), count);
+    }
+    if sorted.len() > 10 {
+        println!("  ... and {} more", sorted.len() - 10);
+    }
+    println!();
+
+    if dry_run {
+        println!("{}", "[DRY RUN] Would contribute the above IPs.".yellow());
+        println!("Run without --dry-run to share with the community.");
+        return Ok(());
+    }
+
+    // Submit to community API
+    print!("{} Submitting to community... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let client = reqwest::Client::new();
+    let payload: Vec<_> = sorted.iter().map(|(ip, count)| {
+        serde_json::json!({
+            "ip": ip,
+            "reports": count
+        })
+    }).collect();
+
+    match client
+        .post(format!("{}/contribute", COMMUNITY_API))
+        .json(&serde_json::json!({
+            "ips": payload,
+            "source": "i1-cli",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("{}", "✓".green());
+            println!();
+            println!(
+                "{} Thank you for contributing to community security!",
+                "🎉".green()
+            );
+        }
+        Ok(resp) => {
+            println!("{}", "✗".red());
+            println!(
+                "Server returned: {} (API may not be live yet)",
+                resp.status()
+            );
+        }
+        Err(_) => {
+            println!("{}", "⚠".yellow());
+            println!();
+            println!(
+                "{}",
+                "Community API not available yet - coming soon!".yellow()
+            );
+            println!("Your IPs have been saved locally. Once the API is live,");
+            println!("run this command again to contribute.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn community_fetch(min_reports: u32, replace: bool, dry_run: bool) -> Result<()> {
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{}",
+        "🌐 FETCHING COMMUNITY BLOCKLIST".cyan().bold()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    print!("{} Fetching from community... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let client = reqwest::Client::new();
+
+    match client
+        .get(format!("{}/blocklist?min_reports={}", COMMUNITY_API, min_reports))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("{}", "✓".green());
+
+            let data: serde_json::Value = resp.json().await?;
+            let ips: Vec<String> = data["ips"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v["ip"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            println!();
+            println!(
+                "{} {} IPs from community (min {} reports)",
+                "Received:".bold(),
+                ips.len().to_string().green(),
+                min_reports
+            );
+
+            if ips.is_empty() {
+                println!("No IPs meet the minimum report threshold.");
+                return Ok(());
+            }
+
+            // Show preview
+            println!();
+            println!("{}", "Preview (first 10):".bold());
+            for ip in ips.iter().take(10) {
+                println!("  {}", ip.red());
+            }
+            if ips.len() > 10 {
+                println!("  ... and {} more", ips.len() - 10);
+            }
+
+            if dry_run {
+                println!();
+                println!("{}", "[DRY RUN] Would import the above IPs.".yellow());
+                return Ok(());
+            }
+
+            // Save to state
+            let mut state = defend::State::load()?;
+
+            if replace {
+                state.blocked_ips = ips;
+                println!();
+                println!("{} Replaced local blocklist with community list.", "✓".green());
+            } else {
+                let mut added = 0;
+                for ip in ips {
+                    if !state.blocked_ips.contains(&ip) {
+                        state.blocked_ips.push(ip);
+                        added += 1;
+                    }
+                }
+                println!();
+                println!("{} Added {} new IPs from community.", "✓".green(), added);
+            }
+
+            state.save()?;
+        }
+        Ok(resp) => {
+            println!("{}", "✗".red());
+            println!("Server returned: {}", resp.status());
+        }
+        Err(_) => {
+            println!("{}", "⚠".yellow());
+            println!();
+            println!(
+                "{}",
+                "Community API not available yet - coming soon!".yellow()
+            );
+            println!();
+            println!("In the meantime, you can manually share blocklists:");
+            println!("  {} defend export --format json > blocklist.json", "i1".cyan());
+            println!("  # Share blocklist.json with others");
+        }
+    }
+
+    Ok(())
+}
+
+async fn community_subscribe(interval: u32, remove: bool) -> Result<()> {
+    use std::fs;
+    use std::process::Command;
+
+    let i1_path = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("i1"));
+
+    let cron_comment = "# i1 community threat sync";
+    let cron_command = format!(
+        "{} defend community fetch --min-reports 10 2>/dev/null",
+        i1_path.display()
+    );
+
+    if remove {
+        // Remove the cron job
+        print!("{} Removing cron job... ", "→".cyan());
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let output = Command::new("crontab")
+            .arg("-l")
+            .output();
+
+        if let Ok(out) = output {
+            let current = String::from_utf8_lossy(&out.stdout);
+            let new_crontab: String = current
+                .lines()
+                .filter(|line| !line.contains("i1 defend community"))
+                .filter(|line| !line.contains(cron_comment))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut child = Command::new("crontab")
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                stdin.write_all(new_crontab.as_bytes())?;
+                stdin.write_all(b"\n")?;
+            }
+            child.wait()?;
+
+            println!("{}", "✓".green());
+            println!("Community sync cron job removed.");
+        } else {
+            println!("{}", "✗".red());
+            println!("Could not access crontab.");
+        }
+
+        return Ok(());
+    }
+
+    // Add the cron job
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{}",
+        "🕐 SETTING UP COMMUNITY SYNC".cyan().bold()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    // Calculate cron schedule based on interval
+    let cron_schedule = match interval {
+        1 => "0 * * * *".to_string(),      // Every hour
+        2 => "0 */2 * * *".to_string(),    // Every 2 hours
+        6 => "0 */6 * * *".to_string(),    // Every 6 hours
+        12 => "0 */12 * * *".to_string(),  // Every 12 hours
+        24 => "0 0 * * *".to_string(),     // Daily
+        _ => format!("0 */{} * * *", interval), // Custom
+    };
+
+    let cron_line = format!("{} {}", cron_schedule, cron_command);
+
+    println!("Will add to crontab:");
+    println!("  {}", cron_line.dimmed());
+    println!();
+
+    // Check if already exists
+    let existing = Command::new("crontab").arg("-l").output();
+    let mut current_crontab = String::new();
+
+    if let Ok(out) = existing {
+        current_crontab = String::from_utf8_lossy(&out.stdout).to_string();
+        if current_crontab.contains("i1 defend community") {
+            println!(
+                "{} Cron job already exists. Use --remove to delete it first.",
+                "Note:".yellow()
+            );
+            return Ok(());
+        }
+    }
+
+    // Add to crontab
+    print!("{} Adding to crontab... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut child = Command::new("crontab")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        if !current_crontab.is_empty() {
+            stdin.write_all(current_crontab.as_bytes())?;
+            if !current_crontab.ends_with('\n') {
+                stdin.write_all(b"\n")?;
+            }
+        }
+        stdin.write_all(cron_comment.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.write_all(cron_line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+
+    child.wait()?;
+    println!("{}", "✓".green());
+
+    println!();
+    println!("{}", "Community sync enabled!".green().bold());
+    println!("Your blocklist will sync every {} hours.", interval);
+    println!();
+    println!("To contribute your blocks back:");
+    println!("  {} defend community contribute --fail2ban", "i1".cyan());
+    println!();
+    println!("To remove this cron job:");
+    println!("  {} defend community subscribe --remove", "i1".cyan());
+
+    Ok(())
+}
+
+async fn community_stats() -> Result<()> {
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{}",
+        "🌐 COMMUNITY THREAT INTELLIGENCE".cyan().bold()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    print!("{} Fetching stats... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let client = reqwest::Client::new();
+
+    match client.get(format!("{}/stats", COMMUNITY_API)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("{}", "✓".green());
+            println!();
+
+            let stats: serde_json::Value = resp.json().await?;
+
+            println!("{}", "Community Statistics:".bold());
+            println!(
+                "  Total blocked IPs:     {}",
+                stats["total_ips"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .to_string()
+                    .green()
+            );
+            println!(
+                "  Active contributors:   {}",
+                stats["contributors"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .to_string()
+                    .cyan()
+            );
+            println!(
+                "  Reports today:         {}",
+                stats["reports_today"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .to_string()
+                    .yellow()
+            );
+            println!(
+                "  Most reported ASN:     {}",
+                stats["top_asn"].as_str().unwrap_or("N/A")
+            );
+            println!(
+                "  Most reported country: {}",
+                stats["top_country"].as_str().unwrap_or("N/A")
+            );
+        }
+        Ok(_) | Err(_) => {
+            println!("{}", "⚠".yellow());
+            println!();
+            println!(
+                "{}",
+                "Community API coming soon!".yellow().bold()
+            );
+            println!();
+            println!("The i1 community threat sharing network will allow:");
+            println!("  • {} - Share your blocked IPs", "Contribute".green());
+            println!("  • {} - Get crowd-sourced blocklists", "Fetch".cyan());
+            println!("  • {} - Auto-sync via cron", "Subscribe".yellow());
+            println!();
+            println!("Local stats:");
+
+            let state = defend::State::load()?;
+            println!("  Your blocked IPs:  {}", state.blocked_ips.len());
+            println!("  Your blocked ASNs: {}", state.blocked_asns.len());
+            println!("  Blocked countries: {}", state.blocked_countries.len());
+            println!();
+            println!("Share this project: {}", "https://github.com/...".cyan().underline());
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_ip(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Extract source IP from an iptables rule line
+fn extract_source_ip(line: &str) -> Option<String> {
+    // iptables -L -n format:
+    // "DROP       all  --  1.2.3.4              0.0.0.0/0"
+    // "DROP       all  --  192.168.1.0/24       0.0.0.0/0"
+    let parts: Vec<&str> = line.split_whitespace().collect();
+
+    // The source IP is typically the 4th field (index 3) after: TARGET PROTO OPT SOURCE
+    if parts.len() >= 4 {
+        let source = parts[3];
+        // Validate it looks like an IP or CIDR
+        if source.contains('.') || source.contains(':') {
+            // Skip "anywhere" placeholder
+            if source != "0.0.0.0/0" && source != "::/0" {
+                return Some(source.to_string());
+            }
+        }
+    }
+
+    None
 }
