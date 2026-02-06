@@ -141,6 +141,91 @@ pub async fn execute(ctx: &Context, args: &ThreatArgs) -> Result<()> {
     Ok(())
 }
 
+/// Look up an IP and display intel only - no ban prompt.
+/// Used by the interactive scan when viewing your own IP.
+pub async fn lookup_only(ctx: &Context, ip: &str) -> Result<()> {
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "{} {}",
+        "🌐 EXTERNAL VIEW:".cyan().bold(),
+        ip.yellow().bold()
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    let host_info = match ctx.shodan_provider() {
+        Ok(provider) => match provider.lookup_host(ip).await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                println!(
+                    "{} Shodan lookup failed: {}",
+                    "⚠".yellow(),
+                    e.to_string().dimmed()
+                );
+                println!();
+                None
+            }
+        },
+        Err(_) => {
+            println!("{} No API key configured, skipping Shodan lookup", "⚠".yellow());
+            println!();
+            None
+        }
+    };
+
+    if let Some(ref info) = host_info {
+        if let Some(ref org) = info.org {
+            println!("  {} {}", "Organization:".cyan(), org.white().bold());
+        }
+        if let Some(ref asn) = info.asn {
+            println!("  {} {}", "ASN:".cyan(), asn.yellow().bold());
+        }
+        if let Some(ref isp) = info.isp {
+            println!("  {} {}", "ISP:".cyan(), isp);
+        }
+
+        let loc_parts: Vec<String> = [
+            info.location.city.clone(),
+            info.location.region_code.clone(),
+            info.location.country_name.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if !loc_parts.is_empty() {
+            println!("  {} {}", "Location:".cyan(), loc_parts.join(", "));
+        }
+
+        if !info.hostnames.is_empty() {
+            println!("  {} {}", "Hostnames:".cyan(), info.hostnames.join(", "));
+        }
+
+        if !info.ports.is_empty() {
+            let ports_str: Vec<String> = info.ports.iter().map(|p| p.to_string()).collect();
+            println!(
+                "  {} {}",
+                "Open Ports:".cyan(),
+                ports_str.join(", ").white()
+            );
+        }
+
+        if !info.vulns.is_empty() {
+            println!(
+                "  {} {}",
+                "🚨 VULNS:".red().bold(),
+                info.vulns.join(", ").red()
+            );
+        } else {
+            println!("  {} {}", "Vulns:".cyan(), "None detected".green());
+        }
+
+        println!();
+    }
+
+    Ok(())
+}
+
 /// Get the IP of the current SSH session (if any)
 fn get_ssh_client_ip() -> Option<String> {
     std::env::var("SSH_CLIENT")

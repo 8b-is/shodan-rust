@@ -543,15 +543,8 @@ async fn external_view(ctx: &Context, my_ip: &Option<String>) -> Result<()> {
     println!("{}", "━".repeat(60).dimmed());
     println!();
 
-    let args = crate::cli::args::ThreatArgs {
-        ip,
-        ban: false,
-        ban_asn: false,
-        execute: false,
-        yes: false,
-    };
-
-    super::threat::execute(ctx, &args).await
+    // Look up our own IP on Shodan - show intel only, no ban prompt
+    super::threat::lookup_only(ctx, &ip).await
 }
 
 async fn defense_status() -> Result<()> {
