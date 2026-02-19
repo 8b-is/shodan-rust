@@ -37,14 +37,10 @@ async fn status(ctx: Context, quick: bool) -> Result<()> {
     let state = defend::State::load()?;
 
     if quick {
-        let countries: Vec<&str> = state
-            .blocked_countries
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
         println!(
-            "Blocking {} countries, {} IPs, {} ASNs | Whitelist: {} IPs",
-            countries.len(),
+            "Blocking {} countries (in), {} countries (out), {} IPs, {} ASNs | Whitelist: {} IPs",
+            state.blocked_countries.len(),
+            state.blocked_countries_outbound.len(),
             state.blocked_ips.len(),
             state.blocked_asns.len(),
             state.whitelisted_ips.len()
@@ -63,17 +59,31 @@ async fn status(ctx: Context, quick: bool) -> Result<()> {
             println!("{}", "Defense Status".bold().underline());
             println!();
 
-            // Countries
+            // Countries (inbound)
             if state.blocked_countries.is_empty() {
-                println!("{} None", "Blocked Countries:".bold());
+                println!("{} None", "Blocked Countries (inbound):".bold());
             } else {
-                println!("{}", "Blocked Countries:".bold());
+                println!("{}", "Blocked Countries (inbound):".bold());
                 for code in &state.blocked_countries {
                     let name = defend::country_name(code);
                     println!("  {} - {}", code.to_uppercase().red(), name);
                 }
             }
             println!();
+
+            // Countries (outbound - honeypot mode)
+            if !state.blocked_countries_outbound.is_empty() {
+                println!(
+                    "{} {}",
+                    "Blocked Countries (outbound".bold(),
+                    "- honeypot mode):".bold()
+                );
+                for code in &state.blocked_countries_outbound {
+                    let name = defend::country_name(code);
+                    println!("  {} - {} {}", code.to_uppercase().red(), name, "(no response)".dimmed());
+                }
+                println!();
+            }
 
             // IPs
             println!(
@@ -122,31 +132,71 @@ async fn geoblock(_ctx: Context, args: GeoblockArgs) -> Result<()> {
     match args.command {
         GeoblockCommands::List => {
             let state = defend::State::load()?;
-            if state.blocked_countries.is_empty() {
+            let has_inbound = !state.blocked_countries.is_empty();
+            let has_outbound = !state.blocked_countries_outbound.is_empty();
+
+            if !has_inbound && !has_outbound {
                 println!("No countries currently blocked.");
                 println!();
                 println!(
                     "Block countries with: {} defend geoblock add cn ru",
                     "i1".cyan()
                 );
+                println!(
+                    "Honeypot mode:       {} defend geoblock add cn ru -d outbound",
+                    "i1".cyan()
+                );
             } else {
-                println!("{}", "Blocked Countries:".bold());
-                for code in &state.blocked_countries {
-                    let name = defend::country_name(code);
-                    println!("  {} - {}", code.to_uppercase().red(), name);
+                if has_inbound {
+                    println!("{}", "Blocked Countries (inbound):".bold());
+                    for code in &state.blocked_countries {
+                        let name = defend::country_name(code);
+                        println!("  {} - {}", code.to_uppercase().red(), name);
+                    }
+                    println!();
+                }
+                if has_outbound {
+                    println!(
+                        "{} {}",
+                        "Blocked Countries (outbound".bold(),
+                        "- honeypot mode):".bold()
+                    );
+                    for code in &state.blocked_countries_outbound {
+                        let name = defend::country_name(code);
+                        println!("  {} - {} {}", code.to_uppercase().red(), name, "(no response)".dimmed());
+                    }
                 }
             }
             Ok(())
         }
-        GeoblockCommands::Add { countries, dry_run } => {
+        GeoblockCommands::Add {
+            countries,
+            direction,
+            dry_run,
+        } => {
             let mut state = defend::State::load()?;
             let mut added = Vec::new();
+            let dir = direction.to_lowercase();
+
+            let block_inbound = dir == "inbound" || dir == "both";
+            let block_outbound = dir == "outbound" || dir == "both";
+
+            if !block_inbound && !block_outbound {
+                anyhow::bail!(
+                    "Invalid direction: {}\nUse: inbound, outbound, or both",
+                    direction
+                );
+            }
 
             for code in &countries {
                 let normalized = code.to_lowercase();
-                if !state.blocked_countries.contains(&normalized) {
+                if block_inbound && !state.blocked_countries.contains(&normalized) {
                     state.blocked_countries.push(normalized.clone());
-                    added.push(normalized);
+                    added.push(format!("{} (inbound)", normalized));
+                }
+                if block_outbound && !state.blocked_countries_outbound.contains(&normalized) {
+                    state.blocked_countries_outbound.push(normalized.clone());
+                    added.push(format!("{} (outbound)", normalized));
                 }
             }
 
@@ -167,32 +217,64 @@ async fn geoblock(_ctx: Context, args: GeoblockArgs) -> Result<()> {
                     "Success:".green().bold(),
                     added.join(", ").red()
                 );
+                if block_outbound {
+                    println!();
+                    println!(
+                        "{}",
+                        "Honeypot mode: they can connect in, but nothing goes back out."
+                            .yellow()
+                    );
+                }
                 println!();
                 println!("Generate rules with: {} defend export", "i1".cyan());
             }
 
             Ok(())
         }
-        GeoblockCommands::Remove { country } => {
+        GeoblockCommands::Remove {
+            country,
+            direction,
+        } => {
             let mut state = defend::State::load()?;
             let normalized = country.to_lowercase();
+            let dir = direction.to_lowercase();
+            let mut removed = false;
 
-            if let Some(pos) = state
-                .blocked_countries
-                .iter()
-                .position(|c| c == &normalized)
-            {
-                state.blocked_countries.remove(pos);
+            if dir == "inbound" || dir == "both" {
+                if let Some(pos) = state
+                    .blocked_countries
+                    .iter()
+                    .position(|c| c == &normalized)
+                {
+                    state.blocked_countries.remove(pos);
+                    removed = true;
+                }
+            }
+
+            if dir == "outbound" || dir == "both" {
+                if let Some(pos) = state
+                    .blocked_countries_outbound
+                    .iter()
+                    .position(|c| c == &normalized)
+                {
+                    state.blocked_countries_outbound.remove(pos);
+                    removed = true;
+                }
+            }
+
+            if removed {
                 state.save()?;
                 println!(
-                    "{} Removed {} from blocked countries.",
+                    "{} Removed {} from blocked countries ({}).",
                     "Success:".green().bold(),
-                    country.to_uppercase().cyan()
+                    country.to_uppercase().cyan(),
+                    dir
                 );
             } else {
                 println!(
-                    "Country {} is not currently blocked.",
-                    country.to_uppercase()
+                    "Country {} is not currently blocked ({}).",
+                    country.to_uppercase(),
+                    dir
                 );
             }
 

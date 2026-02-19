@@ -29,6 +29,7 @@ all-providers = ["shodan", "censys", "criminalip", "native"]
 i1 = { path = "../i1" }
 i1-core = { path = "../i1-core" }
 i1-providers = { path = "../i1-providers" }
+i1-audit = { path = "../i1-audit" }
 
 # CLI framework
 clap = { version = "4.5", features = ["derive", "env", "wrap_help", "color"] }

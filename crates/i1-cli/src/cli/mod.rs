@@ -56,6 +56,7 @@ pub async fn run() -> Result<()> {
         Some(Commands::Defend(args)) => commands::defend::execute(ctx, args).await,
         Some(Commands::Config(args)) => commands::config::execute(ctx, args).await,
         Some(Commands::Threat(args)) => commands::threat::execute(&ctx, &args).await,
+        Some(Commands::Audit(args)) => commands::audit::execute(ctx, args).await,
         None => commands::scan::execute(ctx).await,
     }
 }

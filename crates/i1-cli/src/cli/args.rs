@@ -71,6 +71,9 @@ pub enum Commands {
     /// Quick threat response: lookup + optional ban in one command
     #[command(alias = "t")]
     Threat(ThreatArgs),
+
+    /// System integrity audit: binary hashes, root certs, trust scoring
+    Audit(AuditArgs),
 }
 
 // ============================================================================
@@ -400,6 +403,11 @@ pub enum GeoblockCommands {
         /// Country codes to block
         countries: Vec<String>,
 
+        /// Direction: inbound, outbound, or both (default: inbound)
+        /// Use outbound for honeypot mode: let them in, block responses going out.
+        #[arg(long, short, default_value = "inbound")]
+        direction: String,
+
         /// Show what would happen without making changes
         #[arg(long)]
         dry_run: bool,
@@ -409,6 +417,10 @@ pub enum GeoblockCommands {
     Remove {
         /// Country code to unblock
         country: String,
+
+        /// Direction to unblock from: inbound, outbound, or both (default: both)
+        #[arg(long, short, default_value = "both")]
+        direction: String,
     },
 
     /// Update IP ranges from upstream
@@ -468,4 +480,64 @@ pub enum ConfigCommands {
 
     /// Show config file path
     Path,
+}
+
+// ============================================================================
+// Audit command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct AuditArgs {
+    #[command(subcommand)]
+    pub command: AuditCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCommands {
+    /// Hash system binaries and show trust scores
+    Binaries {
+        /// Publish hashes to the i1.is network
+        #[arg(long)]
+        publish: bool,
+
+        /// Only show binaries below this trust threshold (0.0-1.0)
+        #[arg(long)]
+        below: Option<f64>,
+
+        /// Additional paths to scan (besides system defaults)
+        #[arg(long, value_delimiter = ',')]
+        paths: Option<Vec<String>>,
+    },
+
+    /// Show running process metrics
+    Processes,
+
+    /// Root certificate store inventory
+    Certs {
+        /// Cross-check certs against network consensus
+        #[arg(long)]
+        validate: bool,
+    },
+
+    /// Full system audit (binaries + processes + certs)
+    Full {
+        /// Publish results to the i1.is network
+        #[arg(long)]
+        publish: bool,
+    },
+
+    /// Generate a QR code for independent TTL verification
+    ///
+    /// Scan the QR with your phone (on cell network) to verify your
+    /// system's trust digest from an independent network path.
+    /// If DNS is being poisoned, the phone will see different results.
+    Verify {
+        /// Save QR code PNG to this path (default: ./i1-verify.png)
+        #[arg(long, short, default_value = "i1-verify.png")]
+        output: String,
+
+        /// Only print the verification URL, skip QR generation
+        #[arg(long)]
+        url_only: bool,
+    },
 }

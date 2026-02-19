@@ -1,5 +1,6 @@
 //! Command implementations.
 
+pub mod audit;
 pub mod config;
 pub mod count;
 pub mod defend;

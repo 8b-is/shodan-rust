@@ -13,6 +13,8 @@ members = [
     "crates/i1-native",
     "crates/i1-honeypot",
     "crates/i1-ca",
+    "crates/i1-srv",
+    "crates/i1-audit",
 ]
 
 [workspace.package]
@@ -70,6 +72,8 @@ i1-censys = { path = "crates/i1-censys" }
 i1-criminalip = { path = "crates/i1-criminalip" }
 i1-native = { path = "crates/i1-native" }
 i1-honeypot = { path = "crates/i1-honeypot" }
+i1-srv = { path = "crates/i1-srv" }
+i1-audit = { path = "crates/i1-audit" }
 
 # Testing
 wiremock = "0.6"

@@ -8,8 +8,13 @@ use std::path::PathBuf;
 /// Defense state - what's currently blocked.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
-    /// Blocked country codes (ISO 2-letter, lowercase).
+    /// Blocked country codes (ISO 2-letter, lowercase) - inbound.
     pub blocked_countries: Vec<String>,
+
+    /// Blocked country codes for outbound traffic (ISO 2-letter, lowercase).
+    /// Lets attackers connect in (natural honeypot) but blocks responses going out.
+    #[serde(default)]
+    pub blocked_countries_outbound: Vec<String>,
 
     /// Blocked IP addresses and CIDR ranges.
     pub blocked_ips: Vec<String>,
@@ -17,7 +22,7 @@ pub struct State {
     /// Blocked AS numbers (e.g., "AS12345").
     pub blocked_asns: Vec<String>,
 
-    /// Whitelisted IPs (never blocked).
+    /// Whitelisted IPs (never blocked, including outbound).
     pub whitelisted_ips: Vec<String>,
 }
 
@@ -156,7 +161,24 @@ pub fn generate_nftables(state: &State) -> Result<String> {
         rules.push_str("    }\n\n");
     }
 
-    // Chain
+    // Outbound country sets
+    for country in &state.blocked_countries_outbound {
+        if !state.blocked_countries.contains(country) {
+            rules.push_str(&format!(
+                "    # Country (outbound): {} ({})\n",
+                country.to_uppercase(),
+                country_name(country)
+            ));
+            rules.push_str(&format!("    # Download ranges from: https://www.ipdeny.com/ipblocks/data/aggregated/{country}-aggregated.zone\n"));
+            rules.push_str(&format!("    set country_{country} {{\n"));
+            rules.push_str("        type ipv4_addr\n");
+            rules.push_str("        flags interval\n");
+            rules.push_str("        # elements = { ... load from zone file ... }\n");
+            rules.push_str("    }\n\n");
+        }
+    }
+
+    // Input chain
     rules.push_str("    chain input {\n");
     rules.push_str("        type filter hook input priority 0; policy accept;\n\n");
 
@@ -177,7 +199,30 @@ pub fn generate_nftables(state: &State) -> Result<String> {
         rules.push_str(&format!("        ip saddr @country_{country} drop\n"));
     }
 
-    rules.push_str("    }\n");
+    rules.push_str("    }\n\n");
+
+    // Output chain - outbound blocking (honeypot mode)
+    if !state.blocked_countries_outbound.is_empty() {
+        rules.push_str("    chain output {\n");
+        rules.push_str("        type filter hook output priority 0; policy accept;\n\n");
+
+        // Always allow outbound to whitelisted IPs
+        if !state.whitelisted_ips.is_empty() {
+            rules.push_str("        # Always allow outbound to whitelisted IPs\n");
+            rules.push_str("        ip daddr @whitelist accept\n\n");
+        }
+
+        for country in &state.blocked_countries_outbound {
+            rules.push_str(&format!(
+                "        # Block outbound to {} (honeypot mode)\n",
+                country_name(country)
+            ));
+            rules.push_str(&format!("        ip daddr @country_{country} drop\n"));
+        }
+
+        rules.push_str("    }\n");
+    }
+
     rules.push_str("}\n");
 
     Ok(rules)
@@ -225,6 +270,37 @@ pub fn generate_iptables(state: &State) -> Result<String> {
     rules.push_str("\n# Insert chain into INPUT\n");
     rules.push_str("iptables -I INPUT -j GEOBLOCK\n");
 
+    // Outbound blocking (honeypot mode)
+    if !state.blocked_countries_outbound.is_empty() {
+        rules.push_str("\n# ── Outbound blocking (honeypot mode) ──\n");
+        rules.push_str("# They can connect in, but nothing goes back out.\n");
+        rules.push_str("iptables -N GEOBLOCK_OUT 2>/dev/null || iptables -F GEOBLOCK_OUT\n\n");
+
+        // Always allow outbound to whitelisted IPs
+        for ip in &state.whitelisted_ips {
+            rules.push_str(&format!(
+                "# Whitelist outbound\niptables -A GEOBLOCK_OUT -d {ip} -j ACCEPT\n"
+            ));
+        }
+        if !state.whitelisted_ips.is_empty() {
+            rules.push('\n');
+        }
+
+        for country in &state.blocked_countries_outbound {
+            rules.push_str(&format!(
+                "\n# Block outbound to {} ({})\n",
+                country_name(country),
+                country.to_uppercase()
+            ));
+            rules.push_str(&format!("# Download: curl -s https://www.ipdeny.com/ipblocks/data/aggregated/{country}-aggregated.zone | while read ip; do\n"));
+            rules.push_str("#   iptables -A GEOBLOCK_OUT -d $ip -j DROP\n");
+            rules.push_str("# done\n");
+        }
+
+        rules.push_str("\n# Insert chain into OUTPUT\n");
+        rules.push_str("iptables -I OUTPUT -j GEOBLOCK_OUT\n");
+    }
+
     Ok(rules)
 }
 
@@ -266,6 +342,23 @@ pub fn generate_pf(state: &State) -> Result<String> {
 
     for country in &state.blocked_countries {
         rules.push_str(&format!("# block in quick from <{country}>\n"));
+    }
+
+    // Outbound blocking (honeypot mode)
+    if !state.blocked_countries_outbound.is_empty() {
+        rules.push_str("\n# ── Outbound blocking (honeypot mode) ──\n");
+        rules.push_str("# They can connect in, but nothing goes back out.\n");
+
+        if !state.whitelisted_ips.is_empty() {
+            rules.push_str("pass out quick to <whitelist>\n");
+        }
+
+        for country in &state.blocked_countries_outbound {
+            rules.push_str(&format!(
+                "# block out quick to <{country}>  # {} - honeypot\n",
+                country_name(country)
+            ));
+        }
     }
 
     Ok(rules)
