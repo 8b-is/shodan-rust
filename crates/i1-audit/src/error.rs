@@ -47,7 +47,8 @@ pub enum AuditError {
     #[error("directory walk error: {0}")]
     Walk(String),
 
-    /// procfs error
+    /// procfs error (Linux only)
+    #[cfg(target_os = "linux")]
     #[error("procfs error: {0}")]
     Procfs(String),
 }
